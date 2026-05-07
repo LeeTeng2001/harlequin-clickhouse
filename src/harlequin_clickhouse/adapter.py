@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Sequence
+from urllib.parse import unquote, urlparse
 
-from clickhouse_driver.dbapi import Connection, connect
+import clickhouse_connect
+from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import ClickHouseError
 from harlequin import (
     HarlequinAdapter,
     HarlequinConnection,
@@ -15,17 +19,47 @@ from textual_fastdatatable.backend import AutoBackendType
 
 from harlequin_clickhouse.cli_options import CLICKHOUSE_OPTIONS
 
+_CONNECT_OPTION_NAMES = {
+    "host",
+    "port",
+    "username",
+    "password",
+    "database",
+    "secure",
+    "verify",
+    "connect_timeout",
+    "send_receive_timeout",
+}
+
+
+def _connect_options_from_dsn(dsn: str) -> dict[str, Any]:
+    parsed = urlparse(dsn)
+    options: dict[str, Any] = {}
+    if parsed.hostname:
+        options["host"] = parsed.hostname
+    if parsed.port:
+        options["port"] = parsed.port
+    if parsed.username:
+        options["username"] = unquote(parsed.username)
+    if parsed.password:
+        options["password"] = unquote(parsed.password)
+    if parsed.path and parsed.path != "/":
+        options["database"] = unquote(parsed.path.lstrip("/"))
+    if parsed.scheme == "clickhouses":
+        options["secure"] = True
+    return options
+
 
 class HarlequinClickHouseCursor(HarlequinCursor):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.cur = args[0]
+    def __init__(self, result: Any) -> None:
+        self.result = result
         self._limit: int | None = None
 
     def columns(self) -> list[tuple[str, str]]:
-        # names = self.cur.column_names
-        # types = self.cur.column_types
-        # return list(zip(names, types))
-        return self.cur.columns_with_types
+        return [
+            (name, getattr(type_, "name", str(type_)))
+            for name, type_ in zip(self.result.column_names, self.result.column_types)
+        ]
 
     def set_limit(self, limit: int) -> HarlequinClickHouseCursor:
         self._limit = limit
@@ -33,15 +67,21 @@ class HarlequinClickHouseCursor(HarlequinCursor):
 
     def fetchall(self) -> AutoBackendType:
         try:
-            if self._limit is None:
-                return self.cur.fetchall()
-            else:
-                return self.cur.fetchmany(self._limit)
+            results = self.result.result_rows
+            if self._limit is not None:
+                results = results[: self._limit]
+            return [tuple(self._serialize_json_like_value(value) for value in row) for row in results]
         except Exception as e:
             raise HarlequinQueryError(
                 msg=str(e),
                 title="Harlequin encountered an error while executing your query.",
             ) from e
+
+    @staticmethod
+    def _serialize_json_like_value(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"), default=str)
+        return value
 
 
 class HarlequinClickHouseConnection(HarlequinConnection):
@@ -55,32 +95,70 @@ class HarlequinClickHouseConnection(HarlequinConnection):
         self.init_message = init_message
         self.conn_str = conn_str
         try:
-            if len(conn_str) == 1:
-                self.conn = connect(conn_str[0], **options)
-            else:
-                self.conn = connect(**options)
-            cur = self.conn.cursor()
-            cur.execute("SELECT 1")
+            self.conn = self._connect(conn_str, options)
+            self.conn.command("SELECT 1")
         except Exception as e:
             raise HarlequinConnectionError(
                 msg=str(e),
-                title="Harlequin could not connect to your ClickHouse with clickhouse_driver.",
+                title="Harlequin could not connect to your ClickHouse with clickhouse-connect.",
             ) from e
 
+    @staticmethod
+    def _connect(conn_str: Sequence[str], options: dict[str, Any]) -> Client:
+        connect_options = {**options}
+        if "user" in connect_options:
+            connect_options["username"] = connect_options.pop("user")
+        if "port" in connect_options and connect_options["port"] is not None:
+            connect_options["port"] = int(connect_options["port"])
+        if "connect_timeout" in connect_options and connect_options["connect_timeout"] is not None:
+            connect_options["connect_timeout"] = int(connect_options["connect_timeout"])
+        if "send_receive_timeout" in connect_options and connect_options["send_receive_timeout"] is not None:
+            connect_options["send_receive_timeout"] = int(connect_options["send_receive_timeout"])
+        if "secure" in connect_options and isinstance(connect_options["secure"], str):
+            connect_options["secure"] = connect_options["secure"].lower() == "true"
+        if "verify" in connect_options and isinstance(connect_options["verify"], str):
+            connect_options["verify"] = connect_options["verify"].lower() == "true"
+
+        if len(conn_str) == 1:
+            connect_options = {**_connect_options_from_dsn(conn_str[0]), **connect_options}
+
+        connect_options = {
+            key: value for key, value in connect_options.items() if key in _CONNECT_OPTION_NAMES and value is not None
+        }
+        return clickhouse_connect.get_client(**connect_options)
+
     def execute(self, query: str) -> HarlequinCursor | None:
+        query = query.strip().rstrip(";")
+        if not query.lower().startswith(("select", "show", "describe", "desc", "with", "explain")):
+            try:
+                self.conn.command(query)
+            except Exception as e:
+                raise HarlequinQueryError(
+                    msg=str(e),
+                    title="Harlequin encountered an error while executing your query.",
+                ) from e
+            return None
+
         try:
-            cur = self.conn.cursor()
-            cur.execute(query)
+            result = self.conn.query(query)
+        except ClickHouseError:
+            try:
+                self.conn.command(query)
+            except Exception as e:
+                raise HarlequinQueryError(
+                    msg=str(e),
+                    title="Harlequin encountered an error while executing your query.",
+                ) from e
+            return None
         except Exception as e:
             raise HarlequinQueryError(
                 msg=str(e),
                 title="Harlequin encountered an error while executing your query.",
             ) from e
         else:
-            if cur.description:
-                return HarlequinClickHouseCursor(cur)
-            else:
+            if not result.column_names:
                 return None
+            return HarlequinClickHouseCursor(result)
 
     def get_catalog(self) -> Catalog:
         # This is a small hack to overcome the fact that clickhouse doesn't
@@ -135,57 +213,45 @@ class HarlequinClickHouseConnection(HarlequinConnection):
         ]
 
     def _list_databases(self) -> list[tuple[str]]:
-        conn: Connection = self.conn
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    name
-                FROM system.databases
-                where name not in
-                    ('INFORMATION_SCHEMA', 'system', 'information_schema');
-            """,
-            )
-            results: list[tuple[str]] = cur.fetchall()
-        return results
+        return self.conn.query(
+            """
+            SELECT
+                name
+            FROM system.databases
+            where name not in
+                ('INFORMATION_SCHEMA', 'system', 'information_schema')
+        """,
+        ).result_rows
 
     def _list_relations_in_database(self, db: str) -> list[tuple[str, str]]:
-        conn: Connection = self.conn
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    table_name,
-                    table_type
-                FROM information_schema.tables
-                WHERE
-                    table_schema = '{db}'
-                ORDER BY table_name asc
-                    """,
-            )
-            results: list[tuple[str]] = cur.fetchall()
-        return results
+        return self.conn.query(
+            f"""
+            SELECT
+                table_name,
+                table_type
+            FROM information_schema.tables
+            WHERE
+                table_schema = '{db}'
+            ORDER BY table_name asc
+                """,
+        ).result_rows
 
     def _list_columns_in_relation(
         self,
         db: str,
         relation: str,
     ) -> list[tuple[str, str]]:
-        conn: Connection = self.conn
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                select
-                    column_name, data_type
-                from information_schema.columns
-                where
-                    table_schema = '{db}'
-                    and table_name = '{relation}'
-                    order by ordinal_position asc
-                    """,
-            )
-            results: list[tuple[str]] = cur.fetchall()
-        return results
+        return self.conn.query(
+            f"""
+            select
+                column_name, data_type
+            from information_schema.columns
+            where
+                table_schema = '{db}'
+                and table_name = '{relation}'
+                order by ordinal_position asc
+                """,
+        ).result_rows
 
     @staticmethod
     def _get_short_type(type_name: str) -> str:
@@ -225,10 +291,10 @@ class HarlequinClickHouseConnection(HarlequinConnection):
             "Nullable": "?",
             "IPv4": "ip",
             "IPv6": "ip",
-            "Point": "•",
-            "Ring": "○",
-            "Polygon": "▽",
-            "MultiPolygon": "▽▽",
+            "Point": "*",
+            "Ring": "o",
+            "Polygon": "v",
+            "MultiPolygon": "vv",
             "Expression": "expr",
             "Set": "set",
             "Nothing": "nil",

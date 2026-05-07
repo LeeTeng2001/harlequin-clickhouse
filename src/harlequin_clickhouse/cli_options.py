@@ -8,14 +8,12 @@ from harlequin.options import (
     TextOption,
 )
 
-# All configuration options for the ClickHouse adapter
-# are from [clickhouse_driver clickhouse_driver.connection.Connection](https://clickhouse-driver.readthedocs.io/en/latest/api.html#connection)
+# All configuration options for the ClickHouse adapter are passed to
+# clickhouse_connect.get_client.
 host = TextOption(
     name="host",
     description=(
-        "Specifies the host name of the machine on which the server is running. "
-        "If the value begins with a slash, it is used as the directory for the "
-        "Unix-domain socket."
+        "Specifies the host name of the machine on which the server is running."
     ),
     short_decls=["-h"],
     default="localhost",
@@ -25,10 +23,10 @@ host = TextOption(
 port = TextOption(
     name="port",
     description=(
-        "Port number to connect to at the server host, or socket file name extension for Unix-domain connections."
+        "HTTP(S) port number to connect to at the server host."
     ),
     short_decls=["-p"],
-    default="9000",
+    default="8123",
 )
 
 

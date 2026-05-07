@@ -15,13 +15,13 @@ uv tool install harlequin --with harlequin-clickhouse
 Run Harlequin with the `-a clickhouse` option and pass a ClickHouse DSN as an argument:
 
 ```bash
-harlequin -a clickhouse "clickhouse://default:@localhost:9000/default"
+harlequin -a clickhouse "clickhouse://default:@localhost:8123/default"
 ```
 
 You can also pass all or parts of the connection string as separate options. The following is equivalent to the above DSN:
 
 ```bash
-harlequin -a clickhouse --host localhost --port 9000 --database default --user default
+harlequin -a clickhouse --host localhost --port 8123 --database default --user default
 ```
 
 Many more options are available; to see the full list, run:

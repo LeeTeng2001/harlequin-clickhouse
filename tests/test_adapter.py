@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 from harlequin.adapter import HarlequinAdapter, HarlequinConnection, HarlequinCursor
@@ -10,6 +11,8 @@ from textual_fastdatatable.backend import create_backend
 from harlequin_clickhouse.adapter import (
     HarlequinClickHouseAdapter,
     HarlequinClickHouseConnection,
+    HarlequinClickHouseCursor,
+    _connect_options_from_dsn,
 )
 
 if sys.version_info < (3, 10):
@@ -30,7 +33,7 @@ def test_plugin_discovery() -> None:
 def test_connect() -> None:
     clickhouse = ClickHouseContainer("clickhouse/clickhouse-server:23.4")
     clickhouse.start()
-    conn_str = clickhouse.get_connection_url()
+    conn_str = _http_connection_url(clickhouse)
     conn = HarlequinClickHouseAdapter(conn_str=(conn_str,)).connect()
     assert isinstance(conn, HarlequinConnection)
     clickhouse.stop()
@@ -39,7 +42,7 @@ def test_connect() -> None:
 def test_init_extra_kwargs() -> None:
     clickhouse = ClickHouseContainer("clickhouse/clickhouse-server:23.4")
     clickhouse.start()
-    conn_str = clickhouse.get_connection_url()
+    conn_str = _http_connection_url(clickhouse)
     conn = HarlequinClickHouseAdapter(conn_str=(conn_str,), foo=1, bar="baz").connect()
     assert isinstance(conn, HarlequinConnection)
     clickhouse.stop()
@@ -54,7 +57,7 @@ def test_connection_handles_tuple_conn_str() -> None:
     """Test that HarlequinClickHouseConnection properly handles tuple conn_str parameter"""
     clickhouse = ClickHouseContainer("clickhouse/clickhouse-server:23.4")
     clickhouse.start()
-    conn_str = clickhouse.get_connection_url()
+    conn_str = _http_connection_url(clickhouse)
 
     # Test that connection works when conn_str is passed as tuple
     conn = HarlequinClickHouseConnection(conn_str=(conn_str,), options={})
@@ -62,6 +65,13 @@ def test_connection_handles_tuple_conn_str() -> None:
     assert conn.conn is not None
 
     clickhouse.stop()
+
+
+def _http_connection_url(clickhouse: ClickHouseContainer) -> str:
+    return (
+        f"clickhouse://{clickhouse.username}:{clickhouse.password}"
+        f"@{clickhouse.get_container_host_ip()}:{clickhouse.get_exposed_port(8123)}/{clickhouse.dbname}"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -73,7 +83,7 @@ def connection_setup(request):
         clickhouse.stop()
 
     request.addfinalizer(remove_container)
-    conn_str = clickhouse.get_connection_url()
+    conn_str = _http_connection_url(clickhouse)
     return HarlequinClickHouseAdapter(conn_str=(conn_str,)).connect()
 
 
@@ -128,6 +138,54 @@ def test_set_limit(connection_setup: HarlequinClickHouseConnection) -> None:
     backend = create_backend(data)
     assert backend.column_count == 1
     assert backend.row_count == 2
+
+
+def test_fetchall_serializes_json_like_values() -> None:
+    result = SimpleNamespace(
+        result_rows=[({"a": 1}, ["b", 2], "plain", 3)],
+        column_names=("obj", "arr", "str", "num"),
+        column_types=(),
+    )
+    cur = HarlequinClickHouseCursor(result)
+
+    assert cur.fetchall() == [('{"a":1}', '["b",2]', "plain", 3)]
+
+
+def test_cursor_columns_uses_clickhouse_connect_result_metadata() -> None:
+    result = SimpleNamespace(
+        result_rows=[(1, "x")],
+        column_names=("a", "b"),
+        column_types=(SimpleNamespace(name="UInt8"), SimpleNamespace(name="String")),
+    )
+
+    cur = HarlequinClickHouseCursor(result)
+
+    assert cur.columns() == [("a", "UInt8"), ("b", "String")]
+
+
+def test_connect_options_from_dsn_uses_http_port() -> None:
+    options = _connect_options_from_dsn("clickhouse://user:pass@example.com:8123/mydb")
+
+    assert options == {
+        "host": "example.com",
+        "port": 8123,
+        "username": "user",
+        "password": "pass",
+        "database": "mydb",
+    }
+
+
+def test_connect_options_from_dsn_marks_clickhouses_secure() -> None:
+    options = _connect_options_from_dsn("clickhouses://user:pass@example.com:8443/mydb")
+
+    assert options["secure"] is True
+    assert options["port"] == 8443
+
+
+def test_cli_port_defaults_to_http() -> None:
+    port_option = next(option for option in HarlequinClickHouseAdapter.ADAPTER_OPTIONS if option.name == "port")
+
+    assert port_option.default == "8123"
 
 
 def test_execute_raises_query_error(

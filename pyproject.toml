@@ -6,7 +6,10 @@ authors = [{ name = "Thomaub", email = "github.thomaub@gmail.com" }]
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.9,<3.14.0"
-dependencies = ["harlequin>=2.0", "clickhouse-driver>=0.2.7"]
+dependencies = [
+    "harlequin>=2.0",
+    "clickhouse-connect>=0.15.1",
+]
 keywords = ["harlequin", "clickhouse", "sql", "tui"]
 classifiers = [
   "Development Status :: 4 - Beta",
